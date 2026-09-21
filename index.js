@@ -4,12 +4,14 @@ const cors = require("cors");
 const { Server } = require("socket.io");
 
 const app = express();
-app.use(cors());
+
+const ALLOWED_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: { origin: ALLOWED_ORIGIN, methods: ["GET", "POST"] },
 });
 
 const PORT = process.env.PORT || 3001;
@@ -29,6 +31,11 @@ const RESOLVE_GRACE = 700; // extra time for late packets before the server reso
 const BETWEEN_ROUNDS_MS = 2000; // pause so clients can show the round result
 const EMOTE_COOLDOWN = 1000;
 const OUTCOME_TTL = 24 * 60 * 60 * 1000;
+
+// Rate-limiting: max actions per token within a window
+const RATE_LIMIT_WINDOW = 10 * 1000; // 10 seconds
+const RATE_LIMIT_MAX = 5;            // max lobby creates/joins per window
+const rateLimits = new Map();        // token -> { count, windowStart }
 
 const NO_MOVE = { attack: null, defense: null };
 
@@ -64,6 +71,28 @@ const NO_MOVE = { attack: null, defense: null };
 */
 const rooms = {};
 const outcomes = new Map();
+
+/* ---------- rate limiter ---------- */
+
+function checkRateLimit(token) {
+  const now = Date.now();
+  const entry = rateLimits.get(token);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW) {
+    rateLimits.set(token, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= RATE_LIMIT_MAX) return false;
+  entry.count++;
+  return true;
+}
+
+// Clean up stale rate-limit entries every minute.
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW;
+  for (const [token, entry] of rateLimits) {
+    if (entry.windowStart < cutoff) rateLimits.delete(token);
+  }
+}, 60 * 1000).unref();
 
 /* ---------- helpers ---------- */
 
@@ -221,16 +250,16 @@ function startRound(room, { keepMoves = false } = {}) {
     room.round += 1;
     room.moves = {};
     room.locked = {};
+    room.roundEndsAt = Date.now() + ROUND_MS;
   }
+  // keepMoves: we are resuming after a reconnect — roundEndsAt was already set
+  // when the round started, so we keep it and only recalculate how much is left.
 
   room.phase = "round";
-  room.roundEndsAt = Date.now() + ROUND_MS;
-  room.roundTimer = setTimeout(
-    () => finishRound(room),
-    ROUND_MS + RESOLVE_GRACE
-  );
+  const remaining = Math.max(1000, room.roundEndsAt - Date.now());
+  room.roundTimer = setTimeout(() => finishRound(room), remaining + RESOLVE_GRACE);
 
-  io.to(room.id).emit("roundStart", { round: room.round, endsIn: ROUND_MS });
+  io.to(room.id).emit("roundStart", { round: room.round, endsIn: remaining });
 }
 
 function finishRound(room) {
@@ -273,11 +302,19 @@ function finishRound(room) {
 function suspendRoom(room) {
   clearTimeout(room.roundTimer);
   clearTimeout(room.betweenTimer);
+  // Remember when we paused so resumeRoom can restore the correct remaining time.
+  if (room.phase === "round") room.roundPausedAt = Date.now();
 }
 
 function resumeRoom(room) {
   if (room.phase === "round") {
-    startRound(room, { keepMoves: true }); // same round, fresh full timer
+    // Restore the time that was left when we paused rather than giving a full new timer.
+    if (room.roundPausedAt && room.roundEndsAt) {
+      const elapsed = room.roundPausedAt - (room.roundEndsAt - ROUND_MS);
+      room.roundEndsAt = Date.now() + Math.max(1000, ROUND_MS - elapsed);
+    }
+    room.roundPausedAt = null;
+    startRound(room, { keepMoves: true });
   } else if (room.phase === "between") {
     room.betweenTimer = setTimeout(() => startRound(room), BETWEEN_ROUNDS_MS);
   }
@@ -314,6 +351,8 @@ io.on("connection", (socket) => {
   socket.on("createLobby", ({ username, token, wager } = {}) => {
     if (!token || !username) return fail("Missing player info");
 
+    if (!checkRateLimit(token)) return fail("Too many requests — slow down");
+
     const cleanedWager = cleanWager(wager);
     if (cleanedWager === null) return fail(`Wager must be 0-${MAX_WAGER} coins`);
 
@@ -348,6 +387,8 @@ io.on("connection", (socket) => {
 
   socket.on("joinMatch", ({ roomId, username, token } = {}) => {
     if (!token || !username) return fail("Missing player info");
+
+    if (!checkRateLimit(token)) return fail("Too many requests — slow down");
 
     const room = rooms[String(roomId || "").trim().toUpperCase()];
 
@@ -463,9 +504,12 @@ io.on("connection", (socket) => {
   });
 
   // A player could not cover the wager when the duel started: cancel it, refund everyone.
+  // Only valid before the first round has been resolved (round === 0 means no round has
+  // finished yet). After that, the match is live and can't be voided this way.
   socket.on("stakeFailed", (roomId) => {
     const room = rooms[roomId];
     if (!room || !room.started || !findPlayer(room, socket)) return;
+    if (room.round > 0) return; // too late — at least one round already resolved
     endMatch(room, { reason: "stake", voided: true });
   });
 
